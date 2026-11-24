@@ -11,6 +11,13 @@ every few steps. Checkpoints are written with stable_worldmodel's save_pretraine
            S = epiplexity of the embeddings w.r.t. a frozen random CNN reservoir of the same frames
            (../epiplexity.py); S0 = S of the untrained model, averaged over 4 batches. The Epi arm's only
            architectural change is a non-affine BatchNorm on the projector output (module.ProjectorBN).
+  Epi-dyn: as Epi, with loss.epi.target=next. z_t is scored against the reservoir's view of the NEXT frame
+           x_{t+1} of the same window (epiplexity.dynamics_epiplexity); the last frame of a window is unscored,
+           so the score sees B*(T-1) rows instead of B*T. S0 is measured the same way.
+  Epi-lat: loss.epi.target=latent. The latent-dynamics score: a ridge readout from frozen random features of
+           (z_t, a_t) onto z_{t+1} (epiplexity.latent_dynamics_epiplexity; a_t is the normalised action block the
+           predictor sees). No pixels enter the score. target=latent_delta scores z_{t+1} - z_t instead, and
+           loss.epi.detach_inputs=true stops the gradient through the (z_t, a_t) features.
 
 Settings behind the reported results (steps matter: the cosine schedule spans max_steps):
   python train.py data=tworoom model=epi loss.reg=epi loss.epi.weight=0.03 max_steps=30000  run_name=tw_epi
@@ -18,6 +25,9 @@ Settings behind the reported results (steps matter: the cosine schedule spans ma
   python train.py data=ogb     model=epi loss.reg=epi loss.epi.weight=0.03 max_steps=60000  run_name=cube_epi
   python train.py data=dmc     model=epi loss.reg=epi loss.epi.weight=0.3  max_steps=200000 run_name=reacher_epi
   python train.py data=pusht   model=sigreg loss.reg=sigreg max_steps=60000 run_name=pusht_sigreg   # our SIGReg control
+Dynamics variant (same settings, one extra key):
+  python train.py data=tworoom model=epi loss.reg=epi loss.epi.target=next   loss.epi.weight=0.03 max_steps=30000 run_name=tw_epi_next
+  python train.py data=tworoom model=epi loss.reg=epi loss.epi.target=latent loss.epi.weight=0.03 max_steps=30000 run_name=tw_epi_latent
 Any config key can be overridden with key=value (e.g. seed=2, num_workers=4).
 """
 import json
@@ -37,7 +47,8 @@ from stable_worldmodel.wm.utils import save_pretrained
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent))
-from epiplexity import Reservoir, epiplexity  # noqa: E402  (EpiJEPA, repo root)
+from epiplexity import (LatentReservoir, Reservoir, dynamics_epiplexity, epiplexity,  # noqa: E402  (EpiJEPA, repo root)
+                        latent_dynamics_epiplexity)
 from module import SIGReg  # noqa: E402                     (LeWM, verbatim)
 from utils import get_column_normalizer, get_img_preprocessor  # noqa: E402  (LeWM, verbatim)
 
@@ -68,6 +79,28 @@ def effective_rank(z):
     return float(torch.exp(-(p * p.clamp_min(1e-12).log()).sum()))
 
 
+TARGETS = ("frame", "next", "latent", "latent_delta")
+
+
+def reg_rows(emb, pixels, action, target):
+    """Arguments of the epiplexity score, each flattened over (window, time) to [N, ...].
+
+    frame:        (z_t, x_t)             every frame with its own embedding (EpiWM), N = B*T
+    next:         (z_t, x_{t+1})         N = B*(T-1)
+    latent:       (z_t, a_t, z_{t+1})    N = B*(T-1); latent_delta scores z_{t+1} - z_t instead
+    Pairs never cross a window: slice on the time axis BEFORE flattening.
+    """
+    def flat(t):
+        return t.reshape(-1, *t.shape[2:]).float()
+
+    if target == "frame":
+        return flat(emb), flat(pixels)
+    if target == "next":
+        return flat(emb[:, :-1]), flat(pixels[:, 1:])
+    z, z_next = emb[:, :-1], emb[:, 1:]
+    return flat(z), flat(action[:, :-1]), flat(z_next - z if target == "latent_delta" else z_next)
+
+
 def main():
     cfg = load_cfg(sys.argv[1:])
     torch.manual_seed(cfg.seed); np.random.seed(cfg.seed)
@@ -75,6 +108,9 @@ def main():
     use_epi = cfg.loss.reg == "epi"
     assert cfg.loss.reg in ("sigreg", "epi")
     assert use_epi == cfg.model.projector["_target_"].endswith("ProjectorBN"), "use model=epi with loss.reg=epi"
+    target = cfg.loss.epi.target
+    assert target in TARGETS, f"loss.epi.target must be one of {TARGETS}"
+    latent = target.startswith("latent")
 
     # ---- data (as LeWM's train.py)
     dcfg = OmegaConf.to_container(cfg.data.dataset, resolve=True)
@@ -98,6 +134,14 @@ def main():
     model = hydra.utils.instantiate(cfg.model).to(dev)
     sigreg = SIGReg(**cfg.loss.sigreg.kwargs).to(dev)
     reservoir = Reservoir(cfg.loss.epi.width, cfg.loss.epi.reservoir_seed).to(dev).eval()  # frozen random CNN
+    if latent:  # frozen random MLP on (z_t, a_t) instead of a CNN on frames
+        lat_res = LatentReservoir(cfg.model.projector.output_dim, cfg.model.action_encoder.input_dim,
+                                  cfg.loss.epi.width, cfg.loss.epi.reservoir_seed).to(dev).eval()
+
+    def score_fn(rows):
+        if latent:
+            return latent_dynamics_epiplexity(*rows, lat_res, cfg.loss.epi.detach_inputs)
+        return (dynamics_epiplexity if target == "next" else epiplexity)(*rows, reservoir)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.optimizer.lr, weight_decay=cfg.optimizer.weight_decay)
     T, warm = cfg.max_steps, max(1, int(0.01 * cfg.max_steps))
     sched = torch.optim.lr_scheduler.LambdaLR(
@@ -107,11 +151,11 @@ def main():
     out_dir = Path(cfg.out_dir) / cfg.run_name
     out_dir.mkdir(parents=True, exist_ok=True)
     OmegaConf.save(cfg, out_dir / "config.yaml")
-    print(f"[{cfg.run_name}] reg={cfg.loss.reg} steps={T} train={len(train_set)} val={len(val_set)} "
+    print(f"[{cfg.run_name}] reg={cfg.loss.reg} epi.target={cfg.loss.epi.target} steps={T} train={len(train_set)} val={len(val_set)} "
           f"params={sum(p.numel() for p in model.parameters()) / 1e6:.1f}M", flush=True)
 
     def forward(batch):
-        """Prediction loss, SIGReg (always computed; logged for both arms), embeddings and frames."""
+        """Prediction loss, SIGReg (always computed; logged for both arms), all embeddings, and the score's rows."""
         batch = {k: v.to(dev, non_blocking=True) for k, v in batch.items() if torch.is_tensor(v)}
         batch["action"] = torch.nan_to_num(batch["action"], 0.0)
         with torch.autocast("cuda", torch.bfloat16):
@@ -122,8 +166,7 @@ def main():
         l_pred = (pred.float() - emb[:, P:]).pow(2).mean()
         l_sig = sigreg(emb.transpose(0, 1))
         flat = emb.reshape(-1, emb.size(-1))
-        pix = batch["pixels"].reshape(-1, *batch["pixels"].shape[2:]).float()
-        return l_pred, l_sig, flat, pix
+        return l_pred, l_sig, flat, reg_rows(emb, batch["pixels"], batch["action"], target)
 
     # ---- S0: epiplexity of the untrained model on four training batches (EpiJEPA's normaliser)
     model.train()
@@ -131,18 +174,18 @@ def main():
     with torch.no_grad():
         s0 = []
         for _ in range(4):
-            _, _, flat, pix = forward(next(it))
-            s0.append(float(epiplexity(flat, pix, reservoir)))  # fp32 here; the per-step score runs under bf16 autocast
+            s0.append(float(score_fn(forward(next(it))[3])))  # fp32 here; the per-step score runs under bf16 autocast
     S0 = float(np.mean(s0))
     print(f"[{cfg.run_name}] S0={S0:.3f}", flush=True)
 
     log, t0, step, epoch = [], time.time(), 0, 0
     while step < T:
         for batch in train_dl:
-            l_pred, l_sig, flat, pix = forward(batch)
+            l_pred, l_sig, flat, rows = forward(batch)
             if use_epi:
-                with torch.autocast("cuda", torch.bfloat16):
-                    s = epiplexity(flat, pix, reservoir).float() / S0
+                # the CNN reservoir runs in bf16 as in EpiWM; the latent readout stays fp32 (gradients flow through it)
+                with torch.autocast("cuda", torch.bfloat16, enabled=not latent):
+                    s = score_fn(rows).float() / S0
                 loss = l_pred - cfg.loss.epi.weight * s
             else:
                 loss = l_pred + cfg.loss.sigreg.weight * l_sig
@@ -155,7 +198,7 @@ def main():
 
             if step % cfg.log_every == 0 or step == 1:
                 with torch.no_grad():
-                    epi_ratio = float(s) if use_epi else float(epiplexity(flat.detach(), pix, reservoir)) / S0
+                    epi_ratio = float(s) if use_epi else float(score_fn([r.detach() for r in rows])) / S0
                 row = dict(step=step, epoch=epoch, loss=loss.item(), pred=l_pred.item(), sigreg=l_sig.item(),
                            epi_ratio=epi_ratio, erank=effective_rank(flat.detach()), grad_norm=float(gn),
                            lr=sched.get_last_lr()[0], it_s=step / (time.time() - t0))
@@ -167,8 +210,8 @@ def main():
                 with torch.no_grad():  # 20 validation batches
                     vals = []
                     for i, vb in enumerate(val_dl):
-                        vp, vs, vflat, vpix = forward(vb)
-                        vals.append((float(vp), float(vs), float(epiplexity(vflat, vpix, reservoir)) / S0, effective_rank(vflat)))
+                        vp, vs, vflat, vrows = forward(vb)
+                        vals.append((float(vp), float(vs), float(score_fn(vrows)) / S0, effective_rank(vflat)))
                         if i == 19:
                             break
                 v = np.mean(vals, 0)

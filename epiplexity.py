@@ -60,3 +60,38 @@ def epiplexity(z, x, reservoir):
     with torch.no_grad():
         a = ridge_map(reservoir(x))
     return score(z, a)
+
+def dynamics_epiplexity(z, x_next, reservoir):
+    with torch.no_grad():
+            a = ridge_map(reservoir(x_next))
+    return score(z, a)
+
+
+class LatentReservoir(nn.Module):
+    """Frozen random MLP on (z_t, a_t): the bounded observer of the latent dynamics.
+
+    z and a enter through separate random layers and are summed, so a low-dimensional action is not drowned
+    out by a 192-d latent (each branch has the same output variance for unit-variance inputs).
+    """
+
+    def __init__(self, z_dim, a_dim, width, seed, hidden=512):
+        super().__init__()
+        with torch.random.fork_rng():
+            torch.manual_seed(seed)
+            self.fz, self.fa = nn.Linear(z_dim, hidden), nn.Linear(a_dim, hidden, bias=False)
+            self.out = nn.Linear(hidden, width)
+        self.requires_grad_(False)
+
+    def forward(self, z, a):
+        return self.out(F.elu(self.fz(z) + self.fa(a)))
+
+
+def latent_dynamics_epiplexity(z, a, z_next, reservoir, detach_inputs=False):
+    """Score of z_{t+1} against a ridge readout from frozen random features of (z_t, a_t).
+
+    Unlike `epiplexity`, the features depend on the encoder (through z_t), so the ridge map is differentiable:
+    the encoder is rewarded both for a predictable z_{t+1} and for a z_t whose random features predict it.
+    detach_inputs=True stops the second path (gradient through the target only).
+    """
+    h = reservoir((z.detach() if detach_inputs else z).float(), a.float())
+    return score(z_next, ridge_map(h))
