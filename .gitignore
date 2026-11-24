@@ -6,3 +6,4 @@ __pycache__/
 *.tar.gz
 .venv/
 outs/
+results/rorqual_results/

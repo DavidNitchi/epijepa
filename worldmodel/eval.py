@@ -1,6 +1,6 @@
 import os
 
-os.environ["MUJOCO_GL"] = "egl"
+os.environ.setdefault("MUJOCO_GL", "egl")  # [EpiWM addition] egl unless the caller chose another backend (e.g. osmesa)
 
 import time
 from pathlib import Path

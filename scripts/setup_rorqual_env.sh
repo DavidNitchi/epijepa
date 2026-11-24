@@ -3,7 +3,7 @@
 # One-time environment bootstrap for EpiWM (worldmodel/) on DRAC Rorqual. Run on a LOGIN node:
 #   cd $HOME/epijepa && bash scripts/setup_rorqual_env.sh
 # Builds a uv venv at $VENV_PATH (default <repo>/.venv), used by scripts/{train,eval}_epiwm_rorqual.sh
-# and scripts/download_tworoom_rorqual.sh. Safe to re-run.
+# and scripts/download_lewm_data_rorqual.sh. Safe to re-run (do so after pulling: it adds the Cube packages).
 #
 # uv ships its own standalone Python, which accepts the ordinary manylinux wheels from PyPI (the cluster's
 # module Python does not). So the pinned stack in worldmodel/requirements.txt installs as-is and the torch
@@ -13,7 +13,9 @@
 #   lightning, einops   imported by worldmodel/utils.py and worldmodel/module.py
 #   imageio[ffmpeg]     stable-worldmodel imports imageio, and eval.py writes one mp4 per episode, which
 #                       fails with "Could not find a backend" without the ffmpeg plugin
-#   zstandard           unpacks the LeWM dataset tarball (scripts/download_tworoom_rorqual.sh)
+#   zstandard           unpacks the LeWM dataset tarballs (scripts/download_lewm_data_rorqual.sh)
+#   ogbench, dm_control, pygame, pymunk, shapely
+#                       imported by stable-worldmodel's Cube environment (swm/OGBCube-v0), needed to evaluate Cube
 
 set -eo pipefail
 
@@ -37,15 +39,18 @@ if [ ! -x "$VENV_PATH/bin/python" ]; then
 fi
 uv pip install --python "$VENV_PATH/bin/python" \
     -r "$REPO_DIR/worldmodel/requirements.txt" \
-    lightning einops "imageio[ffmpeg]" zstandard
+    lightning einops "imageio[ffmpeg]" zstandard \
+    ogbench dm_control pygame pymunk shapely
 
 # Smoke test on the login node's CPU: real model from the training config, every loss.epi.target.
 # STABLEWM_HOME only has to exist for the import; nothing is written there by the test.
 export STABLEWM_HOME="${STABLEWM_HOME:-${SCRATCH:-$REPO_DIR}/stablewm}"
 mkdir -p "$STABLEWM_HOME"
 "$VENV_PATH/bin/python" "$REPO_DIR/worldmodel/smoke_test.py"
+# The Cube simulator's imports (rendering needs a GPU node; the job scripts check that themselves).
+MUJOCO_GL=disable "$VENV_PATH/bin/python" -c "import stable_worldmodel, stable_worldmodel.envs.ogbench.cube_env; print('cube environment imports OK')"
 
 echo
 echo "venv ready at $VENV_PATH"
-echo "Next: bash scripts/download_tworoom_rorqual.sh   (login node), then"
+echo "Next: bash scripts/download_lewm_data_rorqual.sh tworoom|cube   (login node), then"
 echo "      mkdir -p outs && sbatch scripts/train_epiwm_rorqual.sh"

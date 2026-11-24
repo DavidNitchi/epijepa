@@ -41,6 +41,10 @@
 # Extra key=value overrides after the script name pass straight through to train.py, e.g.
 #   sbatch scripts/train_epiwm_rorqual.sh loss.epi.detach_inputs=true
 #
+# Other environments: ENV_NAME selects the dataset, train/eval config, step budget and run-name prefix
+# (tworoom: 30k steps, runs tw_*; cube: 60k steps, runs cube_*). For Cube use the wrapper, which carries the
+# right job name and resources: scripts/train_epiwm_cube_rorqual.sh.
+#
 # Budget: the repo reports ~5 h for TwoRoom's 30k steps on a GPU shared four ways; a dedicated H100 should be
 # well under that, but it has not been timed here. train.py logs `it_s` every 200 steps: after a minute,
 # 30000 / it_s seconds is the training time. A task that hits the limit starts over when resubmitted
@@ -53,13 +57,21 @@
 #   <repo>/outs/tworoom_success.tsv                                        (one line per evaluation)
 # A task whose final checkpoint already exists skips training and only evaluates.
 
+# --- environment ---------------------------------------------------------------
+ENV_NAME="${ENV_NAME:-tworoom}"
+case "$ENV_NAME" in
+    tworoom) DATA_CFG=tworoom; H5_REL="tworoom.h5";                    PREFIX=tw;   DEFAULT_STEPS=30000 ;;
+    cube)    DATA_CFG=ogb;     H5_REL="ogbench/cube_single_expert.h5"; PREFIX=cube; DEFAULT_STEPS=60000 ;;
+    *) echo "ERROR: unknown ENV_NAME '$ENV_NAME' (tworoom cube)"; exit 1 ;;
+esac
+
 # --- grid: task -> (arm, lambda, seed), arm-major then lambda ------------------
 ARMS=(${ARMS:-frame latent})
 WEIGHTS=(${WEIGHTS:-${WEIGHT:-0.03}})   # lambda(s) for the epi arms: loss = pred - lambda * S / S0. 0.03 is the
                                    # repo's TwoRoom value, tuned for the frame score. S0 differs between
                                    # scores (frame 257, latent 519 on TwoRoom), so compare arms on lambda / S0.
 SEEDS=(${SEEDS:-3072})             # 3072 is LeWM's default; the repo's other seeds are 2 and 3
-STEPS="${STEPS:-30000}"            # the cosine schedule spans max_steps, so this is part of the recipe
+STEPS="${STEPS:-$DEFAULT_STEPS}"   # the cosine schedule spans max_steps, so this is part of the recipe
 NUM_WORKERS="${NUM_WORKERS:-6}"
 IDX=${SLURM_ARRAY_TASK_ID:-0}
 NTASKS=$(( ${#ARMS[@]} * ${#WEIGHTS[@]} * ${#SEEDS[@]} ))
@@ -71,7 +83,7 @@ ARM=${ARMS[$((IDX / (${#WEIGHTS[@]} * ${#SEEDS[@]})))]}
 WEIGHT=${WEIGHTS[$(((IDX / ${#SEEDS[@]}) % ${#WEIGHTS[@]}))]}
 SEED=${SEEDS[$((IDX % ${#SEEDS[@]}))]}
 W_TAG=""; if [ "$WEIGHT" != 0.03 ] && [ "$ARM" != sigreg ]; then W_TAG="_w$WEIGHT"; fi
-RUN_NAME="tw_${ARM}_s${SEED}${W_TAG}${RUN_TAG:+_$RUN_TAG}"
+RUN_NAME="${PREFIX}_${ARM}_s${SEED}${W_TAG}${RUN_TAG:+_$RUN_TAG}"
 case "$ARM" in
     sigreg) ARM_ARGS=(model=sigreg loss.reg=sigreg) ;;
     frame|next|latent|latent_delta)
@@ -79,7 +91,7 @@ case "$ARM" in
     *) echo "ERROR: unknown arm '$ARM' (frame next latent latent_delta sigreg)"; exit 1 ;;
 esac
 
-echo "$(date) task=$IDX arm=$ARM lambda=$WEIGHT seed=$SEED steps=$STEPS run=$RUN_NAME"
+echo "$(date) env=$ENV_NAME task=$IDX arm=$ARM lambda=$WEIGHT seed=$SEED steps=$STEPS run=$RUN_NAME"
 
 # Don't use `-u`: virtualenv/activate scripts reference unbound vars.
 set -eo pipefail
@@ -99,17 +111,29 @@ source "$VENV_PATH/bin/activate"
 export STABLEWM_HOME="${STABLEWM_HOME:-$SCRATCH/stablewm}"
 # Compute nodes have no internet: nothing is fetched (the ViT is built from its config), make that explicit.
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 WANDB_MODE=offline
-export MUJOCO_GL=egl
+export MUJOCO_GL="${MUJOCO_GL:-egl}"
 export HDF5_USE_FILE_LOCKING=FALSE   # Lustre does not support the locks HDF5 takes by default
 mkdir -p "$STABLEWM_HOME/checkpoints"
 
+# --- Check the simulator before spending GPU hours ------------------------------
+# The evaluation at the end needs the environment to build and render on this node (Cube renders with MuJoCo
+# on the GPU). Check it now: a failure is reported in the first minute, training still runs, and the
+# checkpoint can be evaluated later with scripts/eval_epiwm_rorqual.sh once rendering works.
+RUN_EVAL="${RUN_EVAL:-1}"
+if [ "$RUN_EVAL" = 1 ] && [ "${DRY_RUN:-0}" != 1 ]; then
+    if ! ENV_NAME="$ENV_NAME" PREFLIGHT_ONLY=1 bash "$REPO_DIR/scripts/eval_epiwm_rorqual.sh"; then
+        echo "$(date) WARNING: environment check failed (see above). Training will run; the evaluation is SKIPPED."
+        RUN_EVAL=0
+    fi
+fi
+
 # --- Stage the dataset to node-local NVMe ($SLURM_TMPDIR) ----------------------
-# Training does random reads over the 12.8 GB HDF5 from 6 workers; those are slow and jittery on Lustre.
-# The copy is one sequential read. Falls back to $SCRATCH if there is no room or the copy fails.
-H5_NAME="tworoom.h5"
+# Training does random reads over the HDF5 (12.8 GB TwoRoom, 102 GB Cube) from 6 workers; those are slow and
+# jittery on Lustre. The copy is one sequential read. Falls back to $SCRATCH if there is no room or it fails.
+H5_NAME="$H5_REL"
 SRC_H5="$STABLEWM_HOME/datasets/$H5_NAME"
 if [ ! -s "$SRC_H5" ]; then
-    echo "ERROR: $SRC_H5 not found. Run scripts/download_tworoom_rorqual.sh on a login node first."
+    echo "ERROR: $SRC_H5 not found. Run 'bash scripts/download_lewm_data_rorqual.sh $ENV_NAME' on a login node first."
     exit 1
 fi
 export DATA_ROOT="$STABLEWM_HOME"    # root holding datasets/<file>; the eval script reads it too
@@ -119,7 +143,7 @@ if [ "${DRY_RUN:-0}" != 1 ] && [ -n "${SLURM_TMPDIR:-}" ]; then
     if [[ "$need_kb" =~ ^[0-9]+$ ]] && [[ "$avail_kb" =~ ^[0-9]+$ ]] \
        && [ "$avail_kb" -gt "$(( need_kb + need_kb / 10 ))" ]; then
         t0=$SECONDS
-        mkdir -p "$SLURM_TMPDIR/stablewm/datasets"
+        mkdir -p "$(dirname "$SLURM_TMPDIR/stablewm/datasets/$H5_NAME")"
         if cp "$SRC_H5" "$SLURM_TMPDIR/stablewm/datasets/$H5_NAME"; then
             export DATA_ROOT="$SLURM_TMPDIR/stablewm"
             echo "$(date) staged dataset to $DATA_ROOT in $(( SECONDS - t0 ))s"
@@ -142,14 +166,14 @@ if [ -s "$FINAL_CKPT" ]; then
 else
     # data.dataset.name as an absolute path makes train.py read the staged copy; checkpoints still go to
     # $STABLEWM_HOME/checkpoints/<run_name>.
-    run python train.py data=tworoom "${ARM_ARGS[@]}" \
+    run python train.py "data=$DATA_CFG" "${ARM_ARGS[@]}" \
         max_steps="$STEPS" seed="$SEED" run_name="$RUN_NAME" num_workers="$NUM_WORKERS" \
         "data.dataset.name=$DATA_ROOT/datasets/$H5_NAME" \
         "$@"
 fi
 
 # --- Evaluate (same GPU, same staged dataset) ----------------------------------
-if [ "${RUN_EVAL:-1}" = 1 ]; then
-    RUN_NAME="$RUN_NAME" STEPS="$STEPS" bash "$REPO_DIR/scripts/eval_epiwm_rorqual.sh"
+if [ "$RUN_EVAL" = 1 ]; then
+    ENV_NAME="$ENV_NAME" RUN_NAME="$RUN_NAME" STEPS="$STEPS" bash "$REPO_DIR/scripts/eval_epiwm_rorqual.sh"
 fi
 echo "$(date) $RUN_NAME finished."
