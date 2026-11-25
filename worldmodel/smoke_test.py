@@ -15,12 +15,12 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import train  # noqa: E402
 from epiplexity import (LatentReservoir, Reservoir, dynamics_epiplexity, epiplexity,  # noqa: E402
-                        latent_dynamics_epiplexity)
+                        heldout_score, latent_dynamics_epiplexity)
 
 torch.manual_seed(0)
 base = ["data=tworoom", "model=epi", "loss.reg=epi"]
 cfg = train.load_cfg(base)
-assert cfg.loss.epi.target == "frame" and cfg.loss.epi.detach_inputs is False, "defaults must stay EpiWM"
+assert (cfg.loss.epi.target, cfg.loss.epi.detach_inputs, cfg.loss.epi.heldout) == ("frame", False, False), "defaults must stay EpiWM"
 assert train.load_cfg(base + ["loss.epi.target=latent"]).loss.epi.target == "latent"
 
 # pairing, with ids 10*window + time written into every tensor
@@ -58,7 +58,22 @@ for target, detach in (("frame", False), ("next", False), ("latent", False), ("l
     assert torch.isfinite(s) and s > 0 and torch.isfinite(g).all(), target
     want = dict(frame=[1, 1, 1, 1], next=[1, 1, 1, 0], latent=[0 if detach else 1, 1, 1, 1], latent_delta=[1, 1, 1, 1])[target]
     assert [int(v > 0) for v in g] == want, (target, detach, g)
-    print(f"target={target:12s} detach_inputs={detach!s:5s} rows={rows[0].shape[0]:3d} S={float(s):7.2f} grad reaches frames {want}")
+    if target.startswith("latent"):
+        sh = latent_dynamics_epiplexity(*rows, lat, detach, heldout=True)
+    else:
+        sh = (dynamics_epiplexity if target == "next" else epiplexity)(*rows, cnn, heldout=True)
+    gh = torch.autograd.grad(sh, emb, retain_graph=True)[0]
+    assert torch.isfinite(sh) and torch.isfinite(gh).all() and gh.abs().sum() > 0, (target, "heldout")
+    print(f"target={target:12s} detach_inputs={detach!s:5s} rows={rows[0].shape[0]:3d} S={float(s):7.2f} "
+          f"held-out S={float(sh):7.2f} grad reaches frames {want}")
+
+# held-out scoring at the training row count: noise must earn ~nothing, structure must not
+g = torch.Generator().manual_seed(0)
+h = torch.randn(384, 192, generator=g)
+noise, structure = torch.randn(384, 192, generator=g), h @ torch.linalg.qr(torch.randn(192, 192, generator=g))[0]
+s_noise, s_struct = float(heldout_score(noise, h)), float(heldout_score(structure, h))
+assert abs(s_noise) < 0.05 * s_struct, (s_noise, s_struct)
+print(f"held-out score: noise {s_noise:.1f} vs readable structure {s_struct:.1f}")
 (l_pred - cfg.loss.epi.weight * s / float(s.detach())).backward()
 assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
 print(f"smoke test passed | torch {torch.__version__} | cuda available: {torch.cuda.is_available()}")

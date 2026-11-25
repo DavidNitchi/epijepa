@@ -18,6 +18,10 @@ every few steps. Checkpoints are written with stable_worldmodel's save_pretraine
            (z_t, a_t) onto z_{t+1} (epiplexity.latent_dynamics_epiplexity; a_t is the normalised action block the
            predictor sees). No pixels enter the score. target=latent_delta scores z_{t+1} - z_t instead, and
            loss.epi.detach_inputs=true stops the gradient through the (z_t, a_t) features.
+  Held-out: loss.epi.heldout=true (any target) trains on the cross-fitted score (epiplexity.heldout_score): the
+           readout is fitted on each half of the batch's windows and only structure both fits agree on counts,
+           so unpredictable embeddings earn ~0 instead of most of the score. S0 stays the in-sample score of the
+           untrained model, so lambda means the same with and without it; `epi_in` logs the in-sample score.
 
 Settings behind the reported results (steps matter: the cosine schedule spans max_steps):
   python train.py data=tworoom model=epi loss.reg=epi loss.epi.weight=0.03 max_steps=30000  run_name=tw_epi
@@ -138,10 +142,12 @@ def main():
         lat_res = LatentReservoir(cfg.model.projector.output_dim, cfg.model.action_encoder.input_dim,
                                   cfg.loss.epi.width, cfg.loss.epi.reservoir_seed).to(dev).eval()
 
-    def score_fn(rows):
+    heldout = bool(cfg.loss.epi.heldout)
+
+    def score_fn(rows, heldout=heldout):
         if latent:
-            return latent_dynamics_epiplexity(*rows, lat_res, cfg.loss.epi.detach_inputs)
-        return (dynamics_epiplexity if target == "next" else epiplexity)(*rows, reservoir)
+            return latent_dynamics_epiplexity(*rows, lat_res, cfg.loss.epi.detach_inputs, heldout)
+        return (dynamics_epiplexity if target == "next" else epiplexity)(*rows, reservoir, heldout)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.optimizer.lr, weight_decay=cfg.optimizer.weight_decay)
     T, warm = cfg.max_steps, max(1, int(0.01 * cfg.max_steps))
     sched = torch.optim.lr_scheduler.LambdaLR(
@@ -151,7 +157,7 @@ def main():
     out_dir = Path(cfg.out_dir) / cfg.run_name
     out_dir.mkdir(parents=True, exist_ok=True)
     OmegaConf.save(cfg, out_dir / "config.yaml")
-    print(f"[{cfg.run_name}] reg={cfg.loss.reg} epi.target={cfg.loss.epi.target} steps={T} train={len(train_set)} val={len(val_set)} "
+    print(f"[{cfg.run_name}] reg={cfg.loss.reg} epi.target={cfg.loss.epi.target} heldout={cfg.loss.epi.heldout} steps={T} train={len(train_set)} val={len(val_set)} "
           f"params={sum(p.numel() for p in model.parameters()) / 1e6:.1f}M", flush=True)
 
     def forward(batch):
@@ -174,7 +180,7 @@ def main():
     with torch.no_grad():
         s0 = []
         for _ in range(4):
-            s0.append(float(score_fn(forward(next(it))[3])))  # fp32 here; the per-step score runs under bf16 autocast
+            s0.append(float(score_fn(forward(next(it))[3], heldout=False)))  # always the in-sample score  # fp32 here; the per-step score runs under bf16 autocast
     S0 = float(np.mean(s0))
     print(f"[{cfg.run_name}] S0={S0:.3f}", flush=True)
 
@@ -202,6 +208,9 @@ def main():
                 row = dict(step=step, epoch=epoch, loss=loss.item(), pred=l_pred.item(), sigreg=l_sig.item(),
                            epi_ratio=epi_ratio, erank=effective_rank(flat.detach()), grad_norm=float(gn),
                            lr=sched.get_last_lr()[0], it_s=step / (time.time() - t0))
+                if heldout:  # the in-sample score of the same batch: epi_in - epi_ratio is the credit given to noise
+                    with torch.no_grad():
+                        row["epi_in"] = float(score_fn([r.detach() for r in rows], heldout=False)) / S0
                 log.append(row)
                 print(f"[{cfg.run_name}] " + " ".join(f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}" for k, v in row.items()), flush=True)
 

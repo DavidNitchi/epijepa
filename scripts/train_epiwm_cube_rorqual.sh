@@ -32,6 +32,8 @@
 #   # lambda sweep (3 tasks), or our own frame-score control at the published lambda:
 #   sbatch --array=0-2 --export=ALL,WEIGHTS="0.03 0.1 0.3" scripts/train_epiwm_cube_rorqual.sh
 #   sbatch --export=ALL,ARMS="frame",WEIGHTS="0.03" scripts/train_epiwm_cube_rorqual.sh
+#   # held-out scoring at the three lambdas of the in-sample sweep (82 / 68 / 64 on 200 starts); runs get _ho:
+#   sbatch --array=0-2 --export=ALL,HELDOUT=1,WEIGHTS="0.03 0.1 0.3" scripts/train_epiwm_cube_rorqual.sh
 #   # print the commands without running anything (login node):
 #   DRY_RUN=1 bash scripts/train_epiwm_cube_rorqual.sh
 #

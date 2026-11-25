@@ -47,6 +47,8 @@ loss:
                        #   latent       random MLP features of (z_t,a_t) -> z_{t+1}      (latent dynamics)
                        #   latent_delta random MLP features of (z_t,a_t) -> z_{t+1}-z_t
     detach_inputs: false   # latent targets only: true = no gradient through the (z_t, a_t) features
+    heldout: false     # true = cross-fitted score: fit the readout on each half of the batch's windows and count
+                       # only what both fits agree on, so unpredictable embeddings earn ~0 (any target)
   sigreg:
     weight: 0.09
     kwargs:

@@ -55,16 +55,44 @@ def score(z, a, eta=ETA):
     return 0.5 * torch.linalg.slogdet(eye + eta * w.T @ w)[1] / math.log(2)
 
 
-def epiplexity(z, x, reservoir):
+def heldout_score(z, h, eta=ETA, lam=RIDGE):
+    """Cross-fitted score: only readout structure that two disjoint halves of the batch agree on counts.
+
+    `score` measures W^T W for one readout W fitted on the whole batch. A ridge fit also finds weights for
+    pure noise, so W^T W = (true structure) + (fitting noise), and the noise term is paid for in bits: unpredictable
+    embeddings earn most of the score of predictable ones. Here the readout is fitted twice, W_a on the first
+    half of the rows and W_b on the second, and W^T W is replaced by the symmetrised W_a^T W_b. The two fits
+    share the true structure but their fitting noise is independent, so it averages out: noise earns ~0.
+
+      S = 0.5 * sum_i sign(l_i) * log2(1 + eta * |l_i|),   l_i = eigenvalues of (W_a^T W_b + W_b^T W_a) / 2
+
+    For l_i >= 0 this is the same log-det as `score`; the odd extension to l_i < 0 (the halves disagree in
+    that direction) makes noise cancel in expectation instead of being clipped to a positive value.
+    Rows must be ordered window-major with an even number of windows, so that the midpoint splits windows,
+    not time steps of one window. Features are standardised on the whole batch (both fits use the same
+    coordinates) and the ridge is scaled with the rows of each half (both fits estimate the full-batch W).
+    """
+    h = ((h - h.mean(0)) / h.std(0, unbiased=False).clamp_min(1e-6) / math.sqrt(h.shape[1])).double()
+    z = z.double()
+    n, w = h.shape[0] // 2, []
+    for hh, zz in ((h[:n], z[:n]), (h[n:], z[n:])):
+        aug = torch.cat([hh, math.sqrt(lam * hh.shape[0] / h.shape[0]) * torch.eye(h.shape[1], dtype=h.dtype, device=h.device)])
+        q, r = torch.linalg.qr(aug, mode="reduced")
+        w.append(torch.linalg.solve_triangular(r, q[: hh.shape[0]].T, upper=True) @ (zz - zz.mean(0)))
+    m = w[0].T @ w[1]
+    ev = torch.linalg.eigvalsh(0.5 * (m + m.T))
+    return 0.5 * (ev.sign() * torch.log1p(eta * ev.abs())).sum() / math.log(2)
+
+
+def epiplexity(z, x, reservoir, heldout=False):
     """Score of embedding z (differentiable) against the frozen reservoir's view of images x."""
     with torch.no_grad():
-        a = ridge_map(reservoir(x))
-    return score(z, a)
+        h = reservoir(x)
+        a = None if heldout else ridge_map(h)
+    return heldout_score(z, h) if heldout else score(z, a)
 
-def dynamics_epiplexity(z, x_next, reservoir):
-    with torch.no_grad():
-            a = ridge_map(reservoir(x_next))
-    return score(z, a)
+def dynamics_epiplexity(z, x_next, reservoir, heldout=False):
+    return epiplexity(z, x_next, reservoir, heldout)
 
 
 class LatentReservoir(nn.Module):
@@ -86,7 +114,7 @@ class LatentReservoir(nn.Module):
         return self.out(F.elu(self.fz(z) + self.fa(a)))
 
 
-def latent_dynamics_epiplexity(z, a, z_next, reservoir, detach_inputs=False):
+def latent_dynamics_epiplexity(z, a, z_next, reservoir, detach_inputs=False, heldout=False):
     """Score of z_{t+1} against a ridge readout from frozen random features of (z_t, a_t).
 
     Unlike `epiplexity`, the features depend on the encoder (through z_t), so the ridge map is differentiable:
@@ -94,4 +122,4 @@ def latent_dynamics_epiplexity(z, a, z_next, reservoir, detach_inputs=False):
     detach_inputs=True stops the second path (gradient through the target only).
     """
     h = reservoir((z.detach() if detach_inputs else z).float(), a.float())
-    return score(z_next, ridge_map(h))
+    return heldout_score(z_next, h) if heldout else score(z_next, ridge_map(h))

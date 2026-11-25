@@ -38,8 +38,13 @@
 #   sbatch --time=0:30:00 --export=ALL,STEPS=200,RUN_TAG=smoke,RUN_EVAL=0 scripts/train_epiwm_rorqual.sh
 #   # print the commands for task 1 without running anything (works on a login node):
 #   DRY_RUN=1 SLURM_ARRAY_TASK_ID=1 bash scripts/train_epiwm_rorqual.sh
+#   # held-out (cross-fitted) scoring, loss.epi.heldout=true: HELDOUT=1 adds it and tags the runs _ho, e.g. the
+#   # same four lambdas as the in-sample latent sweep (which scored 99 / 80 / 92.5 / 62.5 on 200 starts):
+#   sbatch --array=0-3 --export=ALL,HELDOUT=1,ARMS="latent",WEIGHTS="0.1 0.3 1 3" scripts/train_epiwm_rorqual.sh
 # Extra key=value overrides after the script name pass straight through to train.py, e.g.
-#   sbatch scripts/train_epiwm_rorqual.sh loss.epi.detach_inputs=true
+#   sbatch --export=ALL,RUN_TAG=detach scripts/train_epiwm_rorqual.sh loss.epi.detach_inputs=true
+# Overrides do not change the run name, and a run whose final checkpoint exists is not retrained: give such
+# runs a RUN_TAG, as above, or they will silently reuse the untagged run's checkpoint.
 #
 # Other environments: ENV_NAME selects the dataset, train/eval config, step budget and run-name prefix
 # (tworoom: 30k steps, runs tw_*; cube: 60k steps, runs cube_*). For Cube use the wrapper, which carries the
@@ -83,13 +88,15 @@ ARM=${ARMS[$((IDX / (${#WEIGHTS[@]} * ${#SEEDS[@]})))]}
 WEIGHT=${WEIGHTS[$(((IDX / ${#SEEDS[@]}) % ${#WEIGHTS[@]}))]}
 SEED=${SEEDS[$((IDX % ${#SEEDS[@]}))]}
 W_TAG=""; if [ "$WEIGHT" != 0.03 ] && [ "$ARM" != sigreg ]; then W_TAG="_w$WEIGHT"; fi
-RUN_NAME="${PREFIX}_${ARM}_s${SEED}${W_TAG}${RUN_TAG:+_$RUN_TAG}"
+H_TAG=""; if [ "${HELDOUT:-0}" = 1 ] && [ "$ARM" != sigreg ]; then H_TAG="_ho"; fi
+RUN_NAME="${PREFIX}_${ARM}_s${SEED}${W_TAG}${H_TAG}${RUN_TAG:+_$RUN_TAG}"
 case "$ARM" in
     sigreg) ARM_ARGS=(model=sigreg loss.reg=sigreg) ;;
     frame|next|latent|latent_delta)
         ARM_ARGS=(model=epi loss.reg=epi "loss.epi.target=$ARM" "loss.epi.weight=$WEIGHT") ;;
     *) echo "ERROR: unknown arm '$ARM' (frame next latent latent_delta sigreg)"; exit 1 ;;
 esac
+if [ -n "$H_TAG" ]; then ARM_ARGS+=(loss.epi.heldout=true); fi
 
 echo "$(date) env=$ENV_NAME task=$IDX arm=$ARM lambda=$WEIGHT seed=$SEED steps=$STEPS run=$RUN_NAME"
 
